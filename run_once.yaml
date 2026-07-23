@@ -1,0 +1,10 @@
+output: "./output"
+iters: 1
+tests:
+  - litmus_tests/bad_order.yaml
+  - litmus_tests/group_broadcast.yaml
+  - litmus_tests/group_race.yaml
+  - litmus_tests/maybe_mismatch.yaml
+  - litmus_tests/multi_thread_broadcast.yaml
+  - litmus_tests/p2p_ring.yaml
+  - litmus_tests/partial_group_broadcast.yaml

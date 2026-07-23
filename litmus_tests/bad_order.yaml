@@ -1,0 +1,21 @@
+name: "Mismatched order of commands between groups"
+description: "Figure 8"
+required_gpus: 2
+buffers_per_gpu: 2
+streams_per_gpu: 1
+buffer_size: 128
+communicators:
+  - [0, 1]
+program: |
+    thread {
+        broadcast<0,0,0>[0,0](int, buffer_size, 0);
+        allReduce<0,0,0>[1,1](int, buffer_size, sum);
+    }
+    thread {
+        allReduce<1,0,0>[1,1](int, buffer_size, sum);
+        broadcast<1,0,0>[0,0](int, buffer_size, 0);
+    }
+initial_values:
+    - [ 0 ]
+    - [ 1 ]
+expected_deadlock: true
