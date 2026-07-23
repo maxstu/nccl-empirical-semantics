@@ -1,0 +1,23 @@
+name: "Single-thread broadcast with group"
+description: "Figure 5"
+required_gpus: 2
+buffers_per_gpu: 1
+streams_per_gpu: 1
+buffer_size: 128
+communicators:
+  - [0, 1]
+program: |
+    thread {
+      group {
+        broadcast<0,0,0>[0,0](int, buffer_size, 0);
+        broadcast<1,0,0>[0,0](int, buffer_size, 0);
+      }
+    }
+initial_values:
+    - [ 42 ]
+    - [ 0 ]
+acceptable_results:
+    - [
+        [ [ 42 ] ],
+        [ [ 42 ] ],
+      ]

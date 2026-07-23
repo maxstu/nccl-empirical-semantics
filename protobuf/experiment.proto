@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package experiment;
+
+message Message {
+    Update update = 1;
+    optional Result result = 2;
+}
+
+message Observation {
+    State state = 1;
+    int32 count = 2;
+}
+
+message Update {
+    enum Status {
+        ERROR = 0;
+        WAITING = 1;
+        RUNNING = 2;
+        COMPLETE = 3;
+    }
+
+    int32 iteration = 1;
+    Status status = 2;
+}
+
+message Result {
+    repeated Observation observations = 1;
+    repeated string errors = 2;
+}
+
+message State {
+    repeated Rank ranks = 1;
+}
+
+message Rank {
+    repeated Buffer buffers = 1;
+}
+
+message Buffer {
+    repeated Element elements = 1;
+}
+
+message Element {
+    float value = 1;
+    optional int32 count = 2;
+}

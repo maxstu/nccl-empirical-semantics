@@ -1,0 +1,28 @@
+name: "Partially grouped broadcast"
+description: "Figure 9"
+required_gpus: 3
+buffers_per_gpu: 1
+streams_per_gpu: 1
+buffer_size: 128
+communicators:
+  - [0, 1, 2]
+program: |
+    thread {
+        broadcast<0,0,0>[0,0](int, buffer_size, 0);
+    }
+    thread {
+        group {
+            broadcast<1,0,0>[0,0](int, buffer_size, 0);
+            broadcast<2,0,0>[0,0](int, buffer_size, 0);
+        }
+    }
+initial_values:
+    - [ 42 ]
+    - [ 0 ]
+    - [ 0 ]
+acceptable_results:
+    - [
+        [ [ 42 ] ],
+        [ [ 42 ] ],
+        [ [ 42 ] ],
+      ]
