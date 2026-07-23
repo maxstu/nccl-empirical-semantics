@@ -1,0 +1,25 @@
+name: "Potential command order mismatch"
+description: "Figure 6"
+required_gpus: 2
+buffers_per_gpu: 2
+streams_per_gpu: 1
+buffer_size: 128
+communicators:
+  - [0, 1]
+program: |
+    thread {
+        broadcast<0,0,0>[0,0](int, buffer_size, 0);
+    }
+    thread {
+        broadcast<1,0,0>[0,0](int, buffer_size, 0);
+    }
+    thread {
+        allReduce<0,0,0>[1,1](int, buffer_size, sum);
+    }
+    thread {
+        allReduce<1,0,0>[1,1](int, buffer_size, sum);
+    }
+initial_values:
+    - [ 0, 1 ]
+    - [ 2, 3 ]
+expected_deadlock: true
