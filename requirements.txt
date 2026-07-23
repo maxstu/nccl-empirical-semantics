@@ -1,0 +1,6 @@
+parsy
+pyzmq
+jinja2
+pyyaml
+tqdm
+protobuf

@@ -1,0 +1,37 @@
+name: "P2P data transfer in a ring"
+description: "Figure 7"
+required_gpus: 3
+buffers_per_gpu: 2
+streams_per_gpu: 1
+buffer_size: 128
+communicators:
+  - [0, 1, 2]
+program: |
+    thread {
+        group {
+            send<0,1,0,0>[0](int, buffer_size);
+            recv<0,2,0,0>[1](int, buffer_size);
+        }
+    }
+    thread {
+        group {
+            send<1,2,0,0>[0](int, buffer_size);
+            recv<1,0,0,0>[1](int, buffer_size);
+        }
+    }
+    thread {
+        group {
+            send<2,0,0,0>[0](int, buffer_size);
+            recv<2,1,0,0>[1](int, buffer_size);
+        }
+    }
+initial_values:
+    - [ 7, 0 ]
+    - [ 42, 0 ]
+    - [ 153, 0 ]
+acceptable_results:
+    - [
+        [ [ 7 ], [ 153 ] ],
+        [ [ 42 ], [ 7 ] ],
+        [ [ 153 ], [ 42 ] ],
+      ]

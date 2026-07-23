@@ -1,0 +1,21 @@
+name: "Write-write race within a group"
+description: "Figure 10"
+required_gpus: 2
+buffers_per_gpu: 2
+streams_per_gpu: 1
+buffer_size: 128
+communicators:
+  - [0, 1]
+program: |
+    thread {
+        broadcast<0,0,0>[0,0](int, buffer_size, 0);
+        broadcast<0,0,0>[1,1](int, buffer_size, 0);
+    }
+    thread {
+        broadcast<1,0,0>[0,0](int, buffer_size, 0);
+        broadcast<1,0,0>[1,0](int, buffer_size, 0);
+    }
+initial_values:
+    - [ 1, 0 ]
+    - [ 0, 0 ]
+expected_undefined_behaviour: true

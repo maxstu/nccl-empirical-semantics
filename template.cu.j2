@@ -1,0 +1,593 @@
+#include "experiment.pb.h"
+#include <algorithm>
+#include <array>
+#include <barrier>
+#include <chrono>
+#include <concepts>
+#include <cuda_runtime.h>
+#include <exception>
+#include <format>
+#include <fstream>
+#include <future>
+#include <iostream>
+#include <map>
+#include <nccl.h>
+#include <ranges>
+#include <set>
+#include <span>
+#include <sstream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+#include <zmq.hpp>
+
+namespace Config {
+constexpr int ITERS = {{iterations}};
+constexpr size_t REQ_GPUS = {{required_gpus}};
+constexpr size_t BUF_SIZE = {{buffer_size}};
+constexpr size_t GPU_BUFS = {{buffers_per_gpu}};
+constexpr size_t STREAMS_PER_GPU = {{streams_per_gpu}};
+constexpr float INIT_VALS[REQ_GPUS][GPU_BUFS] = {{initial_values}};
+constexpr int RESULTS_FREQ = 100;
+constexpr int HEARTBEAT_FREQ = 10;
+} // namespace Config
+
+enum MessageType { resultsRequired, resultsIfAvailable, updateOnly };
+
+class BadUpdateException : public std::exception {
+  private:
+    std::string message;
+
+  public:
+    BadUpdateException()
+        : message("Tried sending an update where a result is required, but no "
+                  "results were available.") {}
+};
+
+class NCCLException : public std::exception {
+  private:
+    std::string message;
+
+  public:
+    NCCLException(const std::string &msg) : message(msg) {}
+
+    template <typename... Args>
+    NCCLException(std::format_string<Args...> fmt, Args &&...args)
+        : message(std::vformat(fmt.get(), std::make_format_args(args...))) {}
+
+    const char *what() const noexcept override { return message.c_str(); }
+};
+
+// Custom error handler, which throws an exception that we typically catch and
+// log
+#define CUDACHECK(cmd)                                                         \
+    do {                                                                       \
+        cudaError_t err = cmd;                                                 \
+        if (err != cudaSuccess) {                                              \
+            throw NCCLException("CUDA error {}:{} '{}'\n", __FILE__, __LINE__, \
+                                cudaGetErrorString(err));                      \
+        }                                                                      \
+    } while (0)
+
+#define NCCLCHECK(cmd)                                                         \
+    do {                                                                       \
+        ncclResult_t res = cmd;                                                \
+        if (res != ncclSuccess) {                                              \
+            throw NCCLException("NCCL error {}:{} '{}'\n", __FILE__, __LINE__, \
+                                ncclGetErrorString(res));                      \
+        }                                                                      \
+    } while (0)
+
+__global__ void initBuffer(float *data, int size, float value) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        data[idx] = value;
+    }
+}
+
+// Generic buffer summary system
+template <typename T> struct Summary {
+    std::vector<T> summary;
+
+    Summary(std::vector<T> v) : summary(std::move(v)) {}
+    Summary() = default;
+
+    auto operator<=>(const Summary<T> &other) const {
+        return std::lexicographical_compare_three_way(
+            summary.begin(), summary.end(), other.summary.begin(),
+            other.summary.end());
+    }
+    bool operator==(const Summary<T> &other) const {
+        return summary == other.summary;
+    }
+
+    experiment::Buffer to_protobuf() const {
+        experiment::Buffer buf;
+        for (const auto &item : summary) {
+            *buf.add_elements() = item.to_protobuf();
+        }
+        return buf;
+    }
+};
+
+template <typename T>
+concept SummaryElement =
+    std::equality_comparable<T> && requires(T a, std::span<const float> input) {
+        { a.to_protobuf() } -> std::same_as<experiment::Element>;
+        { T::from_buffer(input) } -> std::same_as<Summary<T>>;
+    };
+
+struct Run {
+    float value;
+    int length;
+
+    static Summary<Run> from_buffer(std::span<const float> input) {
+        if (input.empty())
+            return {};
+        std::vector<Run> result;
+        float current = input[0];
+        int count = 0;
+        for (float v : input) {
+            if (v == current)
+                count++;
+            else {
+                result.push_back({current, count});
+                current = v;
+                count = 1;
+            }
+        }
+        result.push_back({current, count});
+        return {result};
+    }
+
+    bool operator==(const Run &) const = default;
+    auto operator<=>(const Run &other) const {
+        if (auto cmp = std::compare_strong_order_fallback(value, other.value);
+            cmp != 0)
+            return cmp;
+        return std::strong_order(length, other.length);
+    }
+
+    experiment::Element to_protobuf() const {
+        experiment::Element elem;
+        elem.set_value(value);
+        elem.set_count(length);
+        return elem;
+    }
+};
+
+struct Counter {
+    float value;
+    int count;
+
+    static Summary<Counter> from_buffer(std::span<const float> input) {
+        if (input.empty())
+            return {};
+
+        std::map<float, int> counts;
+        for (float v : input) {
+            counts[v]++;
+        }
+
+        auto result = counts | std::views::transform([](auto const &pair) {
+                          return Counter{pair.first, pair.second};
+                      });
+
+        return Summary<Counter>{
+            std::vector<Counter>(result.begin(), result.end())};
+    }
+
+    bool operator==(const Counter &) const = default;
+    auto operator<=>(const Counter &other) const {
+        if (auto cmp = std::compare_strong_order_fallback(value, other.value);
+            cmp != 0)
+            return cmp;
+        return std::strong_order(count, other.count);
+    }
+
+    experiment::Element to_protobuf() const {
+        experiment::Element elem;
+        elem.set_value(value);
+        elem.set_count(count);
+        return elem;
+    }
+};
+
+struct Unique {
+    float value;
+
+    static Summary<Unique> from_buffer(std::span<const float> input) {
+        if (input.empty())
+            return {};
+        std::set<Unique> result;
+        for (float v : input) {
+            result.insert(Unique{v});
+        }
+        return Summary<Unique>{
+            std::vector<Unique>(result.begin(), result.end())};
+    }
+
+    bool operator==(const Unique &) const = default;
+    auto operator<=>(const Unique &other) const {
+        return std::compare_strong_order_fallback(value, other.value);
+    }
+
+    experiment::Element to_protobuf() const {
+        experiment::Element elem;
+        elem.set_value(value);
+        return elem;
+    }
+};
+
+struct LogEntry {
+    std::array<
+        std::array<std::array<float, Config::BUF_SIZE>, Config::GPU_BUFS>,
+        Config::REQ_GPUS>
+        buffers;
+};
+
+template <SummaryElement T> struct LogSummary {
+    std::array<std::array<Summary<T>, Config::GPU_BUFS>, Config::REQ_GPUS>
+        summaries;
+
+    auto operator<=>(const LogSummary &) const = default;
+
+    experiment::State to_protobuf() const {
+        experiment::State state;
+
+        for (size_t i = 0; i < summaries.size(); ++i) {
+            experiment::Rank *rank_msg = state.add_ranks();
+
+            for (size_t j = 0; j < summaries[i].size(); ++j) {
+                *rank_msg->add_buffers() = summaries[i][j].to_protobuf();
+            }
+        }
+
+        return state;
+    }
+};
+
+template <SummaryElement T> class HostLogger {
+  private:
+    std::vector<LogSummary<T>> logStore;
+    std::vector<std::string> errors;
+    size_t nRanks;
+    size_t nBuffs;
+    size_t size;
+    zmq::context_t zmq_context;
+    zmq::socket_t zmq_socket;
+
+    Summary<T> summarise(const std::span<const float> input) {
+        if (input.empty())
+            return {};
+
+        return T::from_buffer(input);
+    }
+
+    LogSummary<T> summarise(const LogEntry &entry) {
+        LogSummary<T> result;
+
+        for (size_t r = 0; r < Config::REQ_GPUS; ++r) {
+            for (size_t b = 0; b < Config::GPU_BUFS; ++b) {
+                result.summaries[r][b] = summarise(entry.buffers[r][b]);
+            }
+        }
+        return result;
+    }
+
+  public:
+    HostLogger(std::string socket_path)
+        : nRanks(Config::REQ_GPUS), nBuffs(Config::GPU_BUFS),
+          size(Config::BUF_SIZE), zmq_context(1),
+          zmq_socket(zmq_context, zmq::socket_type::pair) {
+        // Reserve space for the log store
+        logStore.reserve(Config::ITERS);
+
+        // Connect to socket to perform handshake
+        std::cout << socket_path << std::endl;
+        zmq_socket.connect(socket_path);
+        zmq_socket.send(zmq::str_buffer("READY"), zmq::send_flags::none);
+        std::cout << "Send READY" << std::endl;
+
+        // Wait for acknowledgement
+        zmq::message_t reply;
+        auto res =
+            zmq_socket.recv(reply, zmq::recv_flags::none); // Blocks until "OK"
+        std::cout << "Got OK" << std::endl;
+    }
+
+    void addEntry(const LogEntry &entry) {
+        logStore.push_back(summarise(entry));
+    }
+
+    void addError(const std::string err) { errors.push_back(err); }
+
+    void sendUpdate(experiment::Update_Status status, int iter,
+                    MessageType msg_type) {
+        experiment::Message msg;
+        // First, add general update info to message
+        auto *update = msg.mutable_update();
+        update->set_status(status);
+        update->set_iteration(iter);
+
+        // Helper to send the message
+        auto transmit = [this, &msg] {
+            std::string serialized;
+            msg.SerializeToString(&serialized);
+            zmq_socket.send(zmq::buffer(serialized), zmq::send_flags::none);
+        };
+
+        // Should we add any available results?
+        if (msg_type == updateOnly) {
+            transmit();
+            return;
+        } // Done
+
+        // Check if there are any results to send
+        if (logStore.empty() && errors.empty()) {
+            // No results available yet.
+            // This should never happen when results are required
+            if (msg_type == resultsRequired)
+                throw BadUpdateException();
+            else /*msg_type == resultsIfAvailable*/ {
+                transmit();
+                return;
+            } // Done
+        }
+
+        // We want to include available results and there are some to be added
+        auto *res = msg.mutable_result();
+        std::map<LogSummary<T>, int> counts;
+        int total_obs = 0;
+        for (const auto &s : logStore) {
+            counts[s]++;
+            total_obs++;
+        }
+        std::cout << "Sending " << total_obs << " observations." << std::endl;
+
+        for (const auto &[element, count] : counts) {
+            auto *obs = res->add_observations();
+            *obs->mutable_state() = element.to_protobuf();
+            obs->set_count(count);
+        }
+
+        for (const auto &err : errors) {
+            res->add_errors(err);
+        }
+
+        // Since we sent the results, we can reset our storage
+        logStore.clear();
+        errors.clear();
+
+        transmit();
+    }
+};
+
+bool is_writable(const std::string file) {
+    std::ofstream test_file(file, std::ios::app);
+
+    if (test_file.is_open()) {
+        test_file.close();
+        return true;
+    }
+    return false;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 3) {
+        std::cout << "I need the starting iteration and socket!" << std::endl;
+        return -1;
+    }
+
+    int start_iter = std::stoi(argv[1]);
+    std::string socket = argv[2];
+
+    printf("Got start iteration: %d\n", start_iter);
+
+    int nDevices;
+    CUDACHECK(cudaGetDeviceCount(&nDevices));
+    printf("Found %d CUDA devices\n", nDevices);
+
+    if (nDevices < Config::REQ_GPUS) {
+        printf("Error: Only %d GPU(s) found. This test expects at least 3.\n",
+               nDevices);
+        return 1;
+    }
+
+    // Use only as many GPUs as required for the experiment
+    const size_t nRanks = Config::REQ_GPUS;
+    const size_t nBuffs = Config::GPU_BUFS;
+
+    // Allocate device buffers and NCCL communicators
+    std::array<std::array<float *, nBuffs>, nRanks> devBuffers;
+    std::array<std::array<ncclComm_t, {{ num_cliques }}>, nRanks> comms;
+    cudaStream_t *streams =
+        (cudaStream_t *)malloc(nRanks * Config::STREAMS_PER_GPU * sizeof(cudaStream_t));
+
+    auto init_comms = [&]() {
+        for (int i = 0; i < nRanks; i++) {
+            for (int j = 0; j < {{ num_cliques }}; j++) {
+                comms[i][j] = nullptr;
+            }
+        }
+
+        {% for clique in communicators %}
+        {
+            ncclUniqueId id;
+            NCCLCHECK(ncclGetUniqueId(&id));
+            NCCLCHECK(ncclGroupStart());
+            {% set clique_idx = loop.index0 %}
+            {% for rank in clique %}
+            CUDACHECK(cudaSetDevice({{ rank }}));
+            NCCLCHECK(ncclCommInitRank(&comms[{{ rank }}][{{ clique_idx }}], {{ clique|length }}, id, {{ loop.index0 }}));
+            {% endfor %}
+            NCCLCHECK(ncclGroupEnd());
+        }
+        {% endfor %}
+    };
+
+    // Initialize NCCL
+    init_comms();
+
+    int size = Config::BUF_SIZE; // Number of floats
+
+    // Create buffers
+    for (int i = 0; i < nRanks; i++) {
+        CUDACHECK(cudaSetDevice(i));
+        for (int j = 0; j < nBuffs; j++) {
+            CUDACHECK(cudaMalloc(&devBuffers[i][j], size * sizeof(float)));
+        }
+        for (int s = 0; s < Config::STREAMS_PER_GPU; s++) {
+            CUDACHECK(cudaStreamCreate(&streams[i * Config::STREAMS_PER_GPU + s]));
+        }
+    }
+
+    HostLogger<Unique> logger(socket);
+
+    auto sync_all = [streams, nRanks] {
+        for (int i = 0; i < nRanks; i++) {
+            CUDACHECK(cudaSetDevice(i));
+            for (int s = 0; s < Config::STREAMS_PER_GPU; s++) {
+                CUDACHECK(cudaStreamSynchronize(streams[i * Config::STREAMS_PER_GPU + s]));
+            }
+        }
+    };
+
+    auto reset_buffers = [devBuffers, streams, size, nRanks, nBuffs] {
+        for (int i = 0; i < nRanks; i++) {
+            int threadsPerBlock = 256;
+            int blocksPerGrid = (size + threadsPerBlock - 1) / threadsPerBlock;
+            cudaSetDevice(i);
+            for (int j = 0; j < nBuffs; j++) {
+                initBuffer<<<blocksPerGrid, threadsPerBlock, 0, streams[i * Config::STREAMS_PER_GPU]>>>(
+                    devBuffers[i][j], size, Config::INIT_VALS[i][j]);
+            }
+        }
+    };
+
+    auto getComm = [&](int rank, int clique) {
+        return comms[rank][clique];
+    };
+
+    auto getStream = [&](int rank, int stream) {
+        return streams[rank * Config::STREAMS_PER_GPU + stream];
+    };
+
+    auto run_test = [devBuffers, streams, getComm, getStream, size](void) {
+        {{program}}
+    };
+
+    auto log_result = [devBuffers, streams, nRanks, nBuffs, size,
+                       &logger](void) {
+        // Heap allocate to prevent stack overflow
+        auto entry = std::make_unique<LogEntry>();
+
+        for (int i = 0; i < nRanks; i++) {
+            CUDACHECK(cudaSetDevice(i));
+            for (int j = 0; j < nBuffs; j++) {
+                CUDACHECK(cudaMemcpy(entry->buffers[i][j].data(),
+                                     devBuffers[i][j], size * sizeof(float),
+                                     cudaMemcpyDeviceToHost));
+            }
+        }
+        logger.addEntry(*entry);
+    };
+
+    auto log_error = [&logger](std::string err) { logger.addError(err); };
+
+    auto reinit_comms_and_streams = [&](void) {
+        // Abort comms and destroy streams
+        for (int i = 0; i < nRanks; i++) {
+            CUDACHECK(cudaSetDevice(i));
+            for (int s = 0; s < Config::STREAMS_PER_GPU; s++) {
+                CUDACHECK(cudaStreamDestroy(streams[i * Config::STREAMS_PER_GPU + s]));
+            }
+            for (int c = 0; c < {{ num_cliques }}; c++) {
+                if (comms[i][c] != nullptr) {
+                    ncclResult_t abort_res = ncclCommAbort(comms[i][c]);
+                    if (abort_res != ncclSuccess) {
+                        log_error(std::format(
+                            "Failed to abort NCCL communicator for rank {} in clique {}: {}", i, c,
+                            ncclGetErrorString(abort_res)));
+                    }
+                    comms[i][c] = nullptr; // to be reinitialised
+                }
+            }
+        }
+        // Re-initialise comms and streams
+        init_comms();
+        for (int i = 0; i < nRanks; i++) {
+            CUDACHECK(cudaSetDevice(i));
+            for (int s = 0; s < Config::STREAMS_PER_GPU; s++) {
+                CUDACHECK(cudaStreamCreate(&streams[i * Config::STREAMS_PER_GPU + s]));
+            }
+        }
+    };
+
+    // Warm test pipeline
+    for (int i = 0; i < 10; i++) {
+        reset_buffers();
+        sync_all();
+
+        try {
+            run_test();
+            sync_all();
+        } catch (const NCCLException &e) {
+            reinit_comms_and_streams();
+        }
+    }
+
+    logger.sendUpdate(experiment::Update_Status_RUNNING, start_iter,
+                      MessageType::updateOnly);
+
+    for (int i = start_iter; i < Config::ITERS; i++) {
+        reset_buffers();
+        sync_all();
+
+        try {
+            run_test();
+            std::cout << "Iteration " << i << " done." << std::endl;
+            sync_all();
+            log_result();
+        } catch (const NCCLException &e) {
+            log_error(e.what());
+            logger.sendUpdate(experiment::Update_Status_ERROR, i,
+                              MessageType::resultsRequired);
+            reinit_comms_and_streams();
+        }
+
+        if (i % Config::RESULTS_FREQ == 0) {
+            logger.sendUpdate(experiment::Update_Status_RUNNING, i,
+                              MessageType::resultsRequired);
+        } else if (i % Config::HEARTBEAT_FREQ == 0) {
+            logger.sendUpdate(experiment::Update_Status_RUNNING, i,
+                              MessageType::updateOnly);
+        }
+    }
+
+    logger.sendUpdate(experiment::Update_Status_COMPLETE, Config::ITERS,
+                      MessageType::resultsIfAvailable);
+
+    // Cleanup
+    for (int i = 0; i < nRanks; i++) {
+        CUDACHECK(cudaSetDevice(i));
+        for (int j = 0; j < nBuffs; j++) {
+            CUDACHECK(cudaFree(devBuffers[i][j]));
+        }
+        for (int s = 0; s < Config::STREAMS_PER_GPU; s++) {
+            CUDACHECK(cudaStreamDestroy(streams[i * Config::STREAMS_PER_GPU + s]));
+        }
+        for (int c = 0; c < {{ num_cliques }}; c++) {
+            if (comms[i][c] != nullptr) {
+                ncclCommDestroy(comms[i][c]);
+            }
+        }
+    }
+
+    free(streams);
+
+    return 0;
+}

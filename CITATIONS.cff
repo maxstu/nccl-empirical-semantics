@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Stupple"
+    given-names: "Max"
+    orcid: "https://orcid.org/0009-0002-5603-7585"
+    affiliation: "Imperial College London"
+  - family-names: "Donaldson"
+    given-names: "Alastair F."
+    affiliation: "https://orcid.org/0000-0002-7448-7961"
+  - family-names: "Raad"
+    given-names: "Azalea"
+    affiliation: "https://orcid.org/0000-0002-2319-3242"
+title: "NCCL Litmus Testing Framework"
+version: "1.0.0"
+doi: "10.5281/zenodo.1234567" # Add your Zenodo DOI here once generated
+date-released: 2026-07-23
+url: "https://github.com/maxstu/nccl-empirical-semantics"
+repository-code: "https://github.com/maxstu/nccl-empirical-semantics"
+license: "MIT"
+keywords:
+  - "NCCL"
+  - "litmus testing"
+  - "semantics"
